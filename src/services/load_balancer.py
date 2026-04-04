@@ -125,6 +125,7 @@ class LoadBalancer:
         reserve: bool = False,
         enforce_concurrency_filter: bool = True,
         track_pending: bool = False,
+        exclude_token_ids: Optional[set[int]] = None,
     ) -> Optional[Token]:
         """
         Select a token using load-aware balancing
@@ -157,11 +158,16 @@ class LoadBalancer:
             debug_logger.log_info(f"[LOAD_BALANCER] ❌ 没有活跃的Token")
             return None
 
+        excluded_ids = {int(token_id) for token_id in (exclude_token_ids or set())}
+
         available_tokens = []
         filtered_reasons = {}
         required_tier = get_required_paygate_tier_for_model(model)
 
         for token in active_tokens:
+            if token.id in excluded_ids:
+                filtered_reasons[token.id] = "本次请求已尝试过该Token"
+                continue
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
             if model and not supports_model_for_tier(model, normalized_tier):
                 filtered_reasons[token.id] = '账号等级不足，需要 ' + get_paygate_tier_label(required_tier)

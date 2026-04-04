@@ -2,6 +2,8 @@
 import asyncio
 import json
 import contextvars
+import hashlib
+import re
 import time
 import uuid
 import random
@@ -19,6 +21,14 @@ try:
     import httpx
 except ImportError:
     httpx = None
+
+
+class RemoteBrowserCapacityError(RuntimeError):
+    """远程打码服务容量不足，可按 retry_after_ms 退避重试。"""
+
+    def __init__(self, message: str = "remote_browser 暂无可用槽位", *, retry_after_ms: int = 500) -> None:
+        super().__init__(message)
+        self.retry_after_ms = max(0, int(retry_after_ms or 0))
 
 
 class FlowClient:
@@ -2168,6 +2178,12 @@ class FlowClient:
         )
 
         if status_code >= 400:
+            if status_code in {409, 429, 503} and isinstance(payload, dict):
+                retry_after_ms = max(0, int(payload.get("retry_after_ms") or 0))
+                error_code = str(payload.get("code") or "").strip().upper()
+                message = str(payload.get("message") or payload.get("detail") or "remote_browser 暂无可用槽位").strip()
+                if error_code == "NO_SLOT" or retry_after_ms > 0:
+                    raise RemoteBrowserCapacityError(message, retry_after_ms=retry_after_ms or 500)
             detail = ""
             if isinstance(payload, dict):
                 detail = payload.get("detail") or payload.get("message") or str(payload)
@@ -2187,6 +2203,8 @@ class FlowClient:
         token_id: Optional[int] = None,
         *,
         cooldown_seconds: float = 8.0,
+        request_timeout_seconds: Optional[int] = None,
+        project_pool_ids: Optional[List[str]] = None,
     ) -> bool:
         """让本地 remote_browser 服务提前开始补池，尽量把取 token 等待搬到前面。"""
         if config.captcha_method != "remote_browser":
@@ -2197,7 +2215,20 @@ class FlowClient:
         if not normalized_project:
             return False
 
-        cache_key = f"{normalized_project}|{normalized_action}|{int(token_id or 0)}"
+        token_context = await self._get_remote_browser_token_context(token_id)
+        normalized_token_id = token_context.get("token_id")
+        if normalized_token_id is None:
+            return False
+        normalized_pool_ids = self._normalize_remote_browser_project_pool_ids(
+            project_pool_ids or token_context.get("project_pool_ids") or [],
+            current_project_id=normalized_project,
+        )
+        pool_signature = self._build_remote_browser_pool_signature(normalized_pool_ids)
+
+        cache_key = (
+            f"{int(normalized_token_id)}|{normalized_action}|"
+            f"{token_context.get('st_version') or '-'}|{pool_signature}"
+        )
         now_value = time.monotonic()
         last_sent = float(self._remote_browser_prefill_last_sent.get(cache_key, 0.0) or 0.0)
         if (now_value - last_sent) < max(0.5, float(cooldown_seconds)):
@@ -2208,11 +2239,14 @@ class FlowClient:
                 method="POST",
                 path="/api/v1/prefill",
                 json_data={
+                    "token_id": normalized_token_id,
                     "project_id": normalized_project,
                     "action": normalized_action,
-                    "token_id": token_id,
+                    "st": token_context.get("st"),
+                    "st_version": token_context.get("st_version"),
+                    "project_pool_ids": normalized_pool_ids,
                 },
-                timeout_override=3,
+                timeout_override=request_timeout_seconds or self._resolve_remote_browser_prefill_timeout(len(normalized_pool_ids)),
             )
             self._remote_browser_prefill_last_sent[cache_key] = now_value
             return True
@@ -2224,20 +2258,192 @@ class FlowClient:
         if config.captcha_method != "remote_browser":
             return 0
 
-        unique_projects: List[str] = []
-        seen_projects = set()
+        unique_tokens: List[Any] = []
+        seen_token_ids = set()
         for token in tokens or []:
+            token_id = getattr(token, "id", None)
             project_id = str(getattr(token, "current_project_id", "") or "").strip()
-            if not project_id or project_id in seen_projects:
+            if (
+                token_id is None
+                or not project_id
+                or token_id in seen_token_ids
+                or not bool(getattr(token, "is_active", False))
+            ):
                 continue
-            seen_projects.add(project_id)
-            unique_projects.append(project_id)
+            seen_token_ids.add(token_id)
+            unique_tokens.append(token)
 
         warmed = 0
-        for project_id in unique_projects:
-            if await self.prefill_remote_browser_pool(project_id, action=action):
+        for token in unique_tokens:
+            project_id = str(getattr(token, "current_project_id", "") or "").strip()
+            token_id = getattr(token, "id", None)
+            if await self.prefill_remote_browser_pool(project_id, action=action, token_id=token_id):
                 warmed += 1
         return warmed
+
+    @staticmethod
+    def _compute_remote_browser_st_version(st: Optional[str]) -> Optional[str]:
+        normalized_st = str(st or "").strip()
+        if not normalized_st:
+            return None
+        return hashlib.sha256(normalized_st.encode("utf-8")).hexdigest()[:16]
+
+    def _get_remote_browser_project_pool_size(self) -> int:
+        try:
+            return max(1, min(50, int(config.personal_project_pool_size or 4)))
+        except Exception:
+            return 4
+
+    @staticmethod
+    def _normalize_remote_browser_project_pool_ids(
+        project_ids: Optional[List[str]],
+        current_project_id: Optional[str] = None,
+    ) -> List[str]:
+        normalized_current = str(current_project_id or "").strip()
+        normalized: List[str] = []
+        seen: set[str] = set()
+
+        if normalized_current:
+            normalized.append(normalized_current)
+            seen.add(normalized_current)
+
+        for raw_project_id in project_ids or []:
+            project_id = str(raw_project_id or "").strip()
+            if not project_id or project_id in seen:
+                continue
+            normalized.append(project_id)
+            seen.add(project_id)
+
+        return normalized
+
+    @staticmethod
+    def _build_remote_browser_pool_signature(project_pool_ids: Optional[List[str]]) -> str:
+        normalized = sorted(
+            {
+                str(project_id or "").strip()
+                for project_id in (project_pool_ids or [])
+                if str(project_id or "").strip()
+            }
+        )
+        return "|".join(normalized) or "-"
+
+    def _resolve_remote_browser_prefill_timeout(self, project_count: int) -> int:
+        base_timeout = max(5, int(config.remote_browser_timeout or 60))
+        target_timeout = max(8, 4 + (max(1, int(project_count or 1)) * 2))
+        return max(5, min(base_timeout, target_timeout))
+
+    @staticmethod
+    def _extract_remote_browser_retry_after_seconds(error: Exception) -> float:
+        if isinstance(error, RemoteBrowserCapacityError):
+            retry_after_ms = max(0, int(error.retry_after_ms or 0))
+            return min(max(retry_after_ms / 1000.0, 0.1), 5.0)
+        match = re.search(r"retry_after_ms=(\d+)", str(error or ""))
+        if not match:
+            return 0.0
+        retry_after_ms = max(0, int(match.group(1)))
+        return min(max(retry_after_ms / 1000.0, 0.1), 5.0)
+
+    async def _get_remote_browser_project_pool_ids(
+        self,
+        token_id: Optional[int],
+        *,
+        token: Optional[Any] = None,
+        current_project_id: Optional[str] = None,
+    ) -> List[str]:
+        token_obj = token
+        try:
+            normalized_token_id = int(token_id) if token_id is not None else None
+        except (TypeError, ValueError):
+            normalized_token_id = None
+
+        if token_obj is None:
+            if normalized_token_id is None or self.db is None:
+                return self._normalize_remote_browser_project_pool_ids([], current_project_id=current_project_id)
+            try:
+                token_obj = await self.db.get_token(normalized_token_id)
+            except Exception as e:
+                debug_logger.log_warning(
+                    f"[reCAPTCHA RemoteBrowser] 读取 token({normalized_token_id}) project 池失败: {e}"
+                )
+                return self._normalize_remote_browser_project_pool_ids([], current_project_id=current_project_id)
+
+        if token_obj is None or self.db is None:
+            return self._normalize_remote_browser_project_pool_ids([], current_project_id=current_project_id)
+
+        pool_size = self._get_remote_browser_project_pool_size()
+        candidate_ids: List[str] = []
+        preferred_project_id = str(
+            current_project_id
+            or getattr(token_obj, "current_project_id", "")
+            or ""
+        ).strip()
+        if preferred_project_id:
+            candidate_ids.append(preferred_project_id)
+
+        token_obj_id = getattr(token_obj, "id", None)
+        if token_obj_id is not None:
+            try:
+                projects = await self.db.get_projects_by_token(int(token_obj_id))
+            except Exception as e:
+                debug_logger.log_warning(
+                    f"[reCAPTCHA RemoteBrowser] 读取 token({token_obj_id}) projects 失败: {e}"
+                )
+                projects = []
+
+            ordered_projects = sorted(
+                [project for project in projects if bool(getattr(project, "is_active", True))],
+                key=lambda project: (
+                    getattr(project, "id", 0) or 0,
+                    str(getattr(project, "project_id", "") or ""),
+                ),
+            )
+            for project in ordered_projects:
+                project_id = str(getattr(project, "project_id", "") or "").strip()
+                if project_id and project_id not in candidate_ids:
+                    candidate_ids.append(project_id)
+
+        return self._normalize_remote_browser_project_pool_ids(
+            candidate_ids[:pool_size],
+            current_project_id=preferred_project_id,
+        )
+
+    async def _get_remote_browser_token_context(self, token_id: Optional[int]) -> Dict[str, Any]:
+        try:
+            normalized_token_id = int(token_id) if token_id is not None else None
+        except (TypeError, ValueError):
+            normalized_token_id = None
+        context: Dict[str, Any] = {
+            "token_id": normalized_token_id,
+            "st": None,
+            "st_version": None,
+            "captcha_proxy_url": None,
+            "project_pool_ids": [],
+        }
+        if normalized_token_id is None or self.db is None:
+            return context
+
+        try:
+            token = await self.db.get_token(normalized_token_id)
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[reCAPTCHA RemoteBrowser] 读取 token({normalized_token_id}) 上下文失败: {e}"
+            )
+            return context
+
+        if token is None:
+            return context
+
+        st = str(getattr(token, "st", "") or "").strip() or None
+        captcha_proxy_url = str(getattr(token, "captcha_proxy_url", "") or "").strip() or None
+        context["st"] = st
+        context["st_version"] = self._compute_remote_browser_st_version(st)
+        context["captcha_proxy_url"] = captcha_proxy_url
+        context["project_pool_ids"] = await self._get_remote_browser_project_pool_ids(
+            normalized_token_id,
+            token=token,
+            current_project_id=str(getattr(token, "current_project_id", "") or "").strip() or None,
+        )
+        return context
 
     def _resolve_remote_browser_solve_timeout(self, action: str) -> int:
         base_timeout = max(5, int(config.remote_browser_timeout or 60))
@@ -2327,6 +2533,7 @@ class FlowClient:
                 return None, None
         elif captcha_method == "remote_browser":
             try:
+                token_context = await self._get_remote_browser_token_context(token_id)
                 solve_timeout = self._resolve_remote_browser_solve_timeout(action)
                 payload = await self._call_remote_browser_service(
                     method="POST",
@@ -2334,7 +2541,14 @@ class FlowClient:
                     json_data={
                         "project_id": project_id,
                         "action": action,
-                        "token_id": token_id,
+                        "token_id": token_context.get("token_id"),
+                        "captcha_proxy_url": token_context.get("captcha_proxy_url"),
+                        "st": token_context.get("st"),
+                        "st_version": token_context.get("st_version"),
+                        "project_pool_ids": self._normalize_remote_browser_project_pool_ids(
+                            token_context.get("project_pool_ids") or [],
+                            current_project_id=project_id,
+                        ),
                     },
                     timeout_override=solve_timeout,
                 )
@@ -2345,7 +2559,16 @@ class FlowClient:
                 if not token or not session_id:
                     raise RuntimeError(f"remote_browser 返回缺少 token/session_id: {payload}")
                 return token, str(session_id)
+            except RemoteBrowserCapacityError:
+                self._set_request_fingerprint(None)
+                raise
             except Exception as e:
+                retry_after_seconds = self._extract_remote_browser_retry_after_seconds(e)
+                if retry_after_seconds > 0:
+                    debug_logger.log_warning(
+                        f"[reCAPTCHA RemoteBrowser] 暂无可用槽位，等待 {retry_after_seconds:.1f}s 后重试"
+                    )
+                    await asyncio.sleep(retry_after_seconds)
                 debug_logger.log_error(f"[reCAPTCHA RemoteBrowser] 错误: {str(e)}")
                 self._set_request_fingerprint(None)
                 return None, None

@@ -15,6 +15,7 @@ from curl_cffi.requests import AsyncSession
 from ..core.auth import AuthManager
 from ..core.database import Database
 from ..core.config import config
+from ..core.logger import debug_logger
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
 from ..services.concurrency_manager import ConcurrencyManager
@@ -35,6 +36,36 @@ concurrency_manager: Optional[ConcurrencyManager] = None
 # Store active admin session tokens (in production, use Redis or database)
 active_admin_tokens = set()
 SUPPORTED_API_CAPTCHA_METHODS = {"yescaptcha", "capmonster", "ezcaptcha", "capsolver"}
+
+
+def _schedule_remote_browser_prefill(
+    *,
+    token_id: Optional[int],
+    project_id: Optional[str],
+    action: str = "IMAGE_GENERATION",
+) -> None:
+    normalized_project_id = str(project_id or "").strip()
+    if (
+        config.captcha_method != "remote_browser"
+        or token_manager is None
+        or token_id is None
+        or not normalized_project_id
+    ):
+        return
+
+    async def _runner() -> None:
+        try:
+            await token_manager.flow_client.prefill_remote_browser_pool(
+                project_id=normalized_project_id,
+                action=action,
+                token_id=token_id,
+            )
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[Admin] remote_browser prefill 失败: token_id={token_id}, project_id={normalized_project_id}, error={e}"
+            )
+
+    asyncio.create_task(_runner())
 
 
 def _mask_token(token: Optional[str]) -> str:
@@ -694,6 +725,12 @@ async def add_token(
                 video_concurrency=new_token.video_concurrency
             )
 
+        if new_token.is_active:
+            _schedule_remote_browser_prefill(
+                token_id=new_token.id,
+                project_id=new_token.current_project_id,
+            )
+
         return {
             "success": True,
             "message": "Token添加成功",
@@ -719,6 +756,8 @@ async def update_token(
 ):
     """Update token - 使用ST自动刷新AT"""
     try:
+        existing_token = await token_manager.get_token(token_id)
+
         # 先ST转AT
         result = await token_manager.flow_client.st_to_at(request.st)
         at = result["access_token"]
@@ -758,6 +797,18 @@ async def update_token(
                     image_concurrency=updated_token.image_concurrency,
                     video_concurrency=updated_token.video_concurrency
                 )
+        else:
+            updated_token = await token_manager.get_token(token_id)
+
+        if (
+            updated_token
+            and updated_token.is_active
+            and str((existing_token.st if existing_token else "") or "").strip() != str(updated_token.st or "").strip()
+        ):
+            _schedule_remote_browser_prefill(
+                token_id=updated_token.id,
+                project_id=updated_token.current_project_id,
+            )
 
         return {"success": True, "message": "Token更新成功"}
     except Exception as e:
@@ -937,6 +988,7 @@ async def import_tokens(
                 existing = existing_by_email.get(email)
 
                 if existing:
+                    previous_st = str(existing.st or "").strip()
                     # 更新现有Token
                     await token_manager.update_token(
                         token_id=existing.id,
@@ -961,6 +1013,11 @@ async def import_tokens(
                     existing.video_enabled = item.video_enabled
                     existing.image_concurrency = item.image_concurrency
                     existing.video_concurrency = item.video_concurrency
+                    if existing.is_active and previous_st != str(existing.st or "").strip():
+                        _schedule_remote_browser_prefill(
+                            token_id=existing.id,
+                            project_id=existing.current_project_id,
+                        )
                     updated += 1
                 else:
                     # 添加新Token
@@ -976,6 +1033,11 @@ async def import_tokens(
                     if is_expired:
                         await token_manager.disable_token(new_token.id)
                         new_token.is_active = False
+                    if new_token.is_active:
+                        _schedule_remote_browser_prefill(
+                            token_id=new_token.id,
+                            project_id=new_token.current_project_id,
+                        )
                     existing_by_email[email] = new_token
                     added += 1
 
@@ -2043,6 +2105,7 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
     if existing_token:
         # Update existing token
         try:
+            previous_st = str(existing_token.st or "").strip()
             # Update token
             await token_manager.update_token(
                 token_id=existing_token.id,
@@ -2054,12 +2117,29 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
             # Check if auto-enable is enabled and token is disabled
             if plugin_config.auto_enable_on_update and not existing_token.is_active:
                 await token_manager.enable_token(existing_token.id)
+                refreshed_token = await token_manager.get_token(existing_token.id)
+                if refreshed_token and refreshed_token.is_active:
+                    _schedule_remote_browser_prefill(
+                        token_id=refreshed_token.id,
+                        project_id=refreshed_token.current_project_id,
+                    )
                 return {
                     "success": True,
                     "message": f"Token updated and auto-enabled for {email}",
                     "action": "updated",
                     "auto_enabled": True
                 }
+
+            refreshed_token = await token_manager.get_token(existing_token.id)
+            if (
+                refreshed_token
+                and refreshed_token.is_active
+                and previous_st != str(refreshed_token.st or "").strip()
+            ):
+                _schedule_remote_browser_prefill(
+                    token_id=refreshed_token.id,
+                    project_id=refreshed_token.current_project_id,
+                )
 
             return {
                 "success": True,
@@ -2075,6 +2155,12 @@ async def plugin_update_token(request: dict, authorization: Optional[str] = Head
                 st=session_token,
                 remark="Added by Chrome Extension"
             )
+
+            if new_token.is_active:
+                _schedule_remote_browser_prefill(
+                    token_id=new_token.id,
+                    project_id=new_token.current_project_id,
+                )
 
             return {
                 "success": True,

@@ -15,6 +15,7 @@ from ..core.account_tiers import (
     supports_model_for_tier,
 )
 from .file_cache import FileCache
+from .flow_client import RemoteBrowserCapacityError
 
 
 # Model configuration
@@ -673,6 +674,9 @@ MODEL_CONFIG = {
 class GenerationHandler:
     """统一生成处理器"""
 
+    _REMOTE_BROWSER_CAPACITY_MAX_WAIT_SECONDS = 15.0
+    _REMOTE_BROWSER_CAPACITY_MAX_WAIT_ATTEMPTS = 3
+
     def __init__(self, flow_client, token_manager, load_balancer, db, concurrency_manager, proxy_manager):
         self.flow_client = flow_client
         self.token_manager = token_manager
@@ -688,7 +692,13 @@ class GenerationHandler:
 
     def _create_generation_result(self) -> Dict[str, Any]:
         """????????????????"""
-        return dict(success=False, error_message=None, error_emitted=False)
+        return dict(
+            success=False,
+            error_message=None,
+            error_emitted=False,
+            error_status_code=500,
+            count_as_token_error=True,
+        )
 
     def _create_response_state(self) -> Dict[str, Any]:
         """为单次请求创建独立的响应状态，避免并发请求互相污染。"""
@@ -697,12 +707,22 @@ class GenerationHandler:
             "generated_assets": None,
         }
 
-    def _mark_generation_failed(self, generation_result: Optional[Dict[str, Any]], error_message: str):
+    def _mark_generation_failed(
+        self,
+        generation_result: Optional[Dict[str, Any]],
+        error_message: str,
+        *,
+        status_code: int = 500,
+        error_emitted: bool = True,
+        count_as_token_error: bool = True,
+    ):
         """????????????????????"""
         if isinstance(generation_result, dict):
             generation_result["success"] = False
             generation_result["error_message"] = error_message
-            generation_result["error_emitted"] = True
+            generation_result["error_emitted"] = bool(error_emitted)
+            generation_result["error_status_code"] = max(100, int(status_code or 500))
+            generation_result["count_as_token_error"] = bool(count_as_token_error)
 
     def _mark_generation_succeeded(self, generation_result: Optional[Dict[str, Any]]):
         """???????"""
@@ -710,6 +730,8 @@ class GenerationHandler:
             generation_result["success"] = True
             generation_result["error_message"] = None
             generation_result["error_emitted"] = False
+            generation_result["error_status_code"] = None
+            generation_result["count_as_token_error"] = False
 
     def _normalize_error_message(self, error_message: Any, max_length: int = 1000) -> str:
         """归一化错误文本，避免写入超长内容。"""
@@ -717,6 +739,85 @@ class GenerationHandler:
         if len(text) <= max_length:
             return text
         return f"{text[:max_length - 3]}..."
+
+    async def _select_generation_token(
+        self,
+        *,
+        generation_type: str,
+        model: str,
+        exclude_token_ids: Optional[set[int]] = None,
+    ):
+        if generation_type == "image":
+            return await self.load_balancer.select_token(
+                for_image_generation=True,
+                model=model,
+                reserve=False,
+                enforce_concurrency_filter=False,
+                track_pending=True,
+                exclude_token_ids=exclude_token_ids,
+            )
+
+        return await self.load_balancer.select_token(
+            for_video_generation=True,
+            model=model,
+            reserve=False,
+            enforce_concurrency_filter=False,
+            track_pending=True,
+            exclude_token_ids=exclude_token_ids,
+        )
+
+    async def _release_generation_pending_token(
+        self,
+        token,
+        generation_type: Optional[str],
+        pending_token_state: Optional[Dict[str, bool]],
+    ) -> None:
+        if not pending_token_state or not pending_token_state.get("active") or not token or not self.load_balancer:
+            return
+        await self.load_balancer.release_pending(
+            token.id,
+            for_image_generation=(generation_type == "image"),
+            for_video_generation=(generation_type == "video"),
+        )
+        pending_token_state["active"] = False
+
+    def _resolve_capacity_wait_seconds(self, error: RemoteBrowserCapacityError) -> float:
+        retry_after_ms = max(0, int(getattr(error, "retry_after_ms", 0) or 0))
+        retry_after_seconds = retry_after_ms / 1000.0 if retry_after_ms > 0 else 0.0
+        return min(max(retry_after_seconds or 1.0, 1.0), 5.0)
+
+    def _build_capacity_timeout_message(self) -> str:
+        return "远程打码等待超时：暂无可用槽位"
+
+    def _schedule_remote_browser_generation_prefill(
+        self,
+        *,
+        token_id: Optional[int],
+        project_id: Optional[str],
+        action: str,
+    ) -> None:
+        normalized_project_id = str(project_id or "").strip()
+        if (
+            config.captcha_method != "remote_browser"
+            or token_id is None
+            or not normalized_project_id
+        ):
+            return
+
+        async def _runner() -> None:
+            try:
+                await self.flow_client.prefill_remote_browser_pool(
+                    project_id=normalized_project_id,
+                    action=action,
+                    token_id=token_id,
+                    request_timeout_seconds=3,
+                )
+            except Exception as e:
+                debug_logger.log_warning(
+                    f"[GENERATION] runtime remote prefill 失败: token_id={token_id}, project_id={normalized_project_id}, error={e}"
+                )
+
+        asyncio.create_task(_runner())
 
     async def _fail_video_task(self, operations: Optional[List[Dict[str, Any]]], error_message: str):
         """将视频任务收口到失败态，避免残留 processing。"""
@@ -822,161 +923,221 @@ class GenerationHandler:
                 progress=0,
             )
 
-        # 2. 选择Token
-        debug_logger.log_info(f"[GENERATION] 正在选择可用Token...")
-        token_select_started_at = time.time()
-
-        if generation_type == "image":
-            token = await self.load_balancer.select_token(
-                for_image_generation=True,
-                model=model,
-                reserve=False,
-                enforce_concurrency_filter=False,
-                track_pending=True,
-            )
-        else:
-            token = await self.load_balancer.select_token(
-                for_video_generation=True,
-                model=model,
-                reserve=False,
-                enforce_concurrency_filter=False,
-                track_pending=True,
-            )
-        perf_trace["token_select_ms"] = int((time.time() - token_select_started_at) * 1000)
-
-        if not token:
-            error_msg = None
-            if self.load_balancer and hasattr(self.load_balancer, "get_unavailable_reason"):
-                error_msg = await self.load_balancer.get_unavailable_reason(
-                    for_image_generation=(generation_type == "image"),
-                    for_video_generation=(generation_type == "video"),
-                    model=model,
-                )
-            if not error_msg:
-                error_msg = self._get_no_token_error_message(generation_type)
-            debug_logger.log_error(f"[GENERATION] {error_msg}")
-            await self._log_request(
-                token_id=None,
-                operation=request_operation,
-                request_data=request_payload,
-                response_data={"error": error_msg, "performance": perf_trace},
-                status_code=503,
-                duration=time.time() - start_time,
-                log_id=request_log_state.get("id"),
-                status_text="failed",
-                progress=request_log_state.get("progress", 0),
-            )
-            if stream:
-                yield self._create_stream_chunk(f"❌ {error_msg}\n")
-            yield self._create_error_response(error_msg, status_code=503)
-            return
-
-        debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
-        pending_token_state["active"] = True
-        await self._update_request_log_progress(
-            request_log_state,
-            token_id=token.id,
-            status_text="token_selected",
-            progress=8,
-            response_extra={"token_email": token.email},
-        )
+        tried_capacity_token_ids: set[int] = set()
+        capacity_wait_attempts = 0
+        capacity_wait_elapsed_ms = 0
+        capacity_last_error: Optional[RemoteBrowserCapacityError] = None
+        perf_trace["remote_browser_capacity_wait_ms"] = 0
+        perf_trace["remote_browser_capacity_wait_attempts"] = 0
+        perf_trace["remote_browser_capacity_token_switches"] = 0
 
         try:
-            # 3. 确保AT有效
-            debug_logger.log_info(f"[GENERATION] 检查Token AT有效性...")
-            if stream:
-                yield self._create_stream_chunk("初始化生成环境...\n")
+            while True:
+                debug_logger.log_info(f"[GENERATION] 正在选择可用Token...")
+                token_select_started_at = time.time()
+                token = await self._select_generation_token(
+                    generation_type=generation_type,
+                    model=model,
+                    exclude_token_ids=tried_capacity_token_ids or None,
+                )
+                perf_trace["token_select_ms"] = int((time.time() - token_select_started_at) * 1000)
 
-            await self._update_request_log_progress(
-                request_log_state,
-                token_id=token.id,
-                status_text="token_ready",
-                progress=15,
-            )
-            ensure_at_started_at = time.time()
-            token = await self.token_manager.ensure_valid_token(token)
-            perf_trace["ensure_at_ms"] = int((time.time() - ensure_at_started_at) * 1000)
-            if not token:
-                error_msg = "Token AT无效或刷新失败"
-                debug_logger.log_error(f"[GENERATION] {error_msg}")
-                if stream:
-                    yield self._create_stream_chunk(f"❌ {error_msg}\n")
-                yield self._create_error_response(error_msg, status_code=503)
-                return
+                if not token:
+                    if tried_capacity_token_ids and capacity_last_error is not None:
+                        remaining_budget_ms = max(
+                            0,
+                            int((self._REMOTE_BROWSER_CAPACITY_MAX_WAIT_SECONDS * 1000) - capacity_wait_elapsed_ms),
+                        )
+                        if (
+                            capacity_wait_attempts < self._REMOTE_BROWSER_CAPACITY_MAX_WAIT_ATTEMPTS
+                            and remaining_budget_ms > 0
+                        ):
+                            wait_seconds = min(
+                                self._resolve_capacity_wait_seconds(capacity_last_error),
+                                remaining_budget_ms / 1000.0,
+                            )
+                            wait_ms = max(0, int(wait_seconds * 1000))
+                            if wait_ms > 0:
+                                capacity_wait_attempts += 1
+                                capacity_wait_elapsed_ms += wait_ms
+                                perf_trace["remote_browser_capacity_wait_ms"] = capacity_wait_elapsed_ms
+                                perf_trace["remote_browser_capacity_wait_attempts"] = capacity_wait_attempts
+                                tried_capacity_token_ids.clear()
+                                if stream:
+                                    yield self._create_stream_chunk(
+                                        f"远程打码容量不足，等待 {wait_seconds:.1f}s 后重试...\n"
+                                    )
+                                debug_logger.log_warning(
+                                    f"[GENERATION] 远程打码容量不足，等待 {wait_seconds:.1f}s 后重试 "
+                                    f"({capacity_wait_attempts}/{self._REMOTE_BROWSER_CAPACITY_MAX_WAIT_ATTEMPTS})"
+                                )
+                                await asyncio.sleep(wait_seconds)
+                                continue
 
-            # 4. 确保Project存在
-            debug_logger.log_info(f"[GENERATION] 检查/创建Project...")
+                        error_msg = self._build_capacity_timeout_message()
+                    else:
+                        error_msg = None
+                        if self.load_balancer and hasattr(self.load_balancer, "get_unavailable_reason"):
+                            error_msg = await self.load_balancer.get_unavailable_reason(
+                                for_image_generation=(generation_type == "image"),
+                                for_video_generation=(generation_type == "video"),
+                                model=model,
+                            )
+                        if not error_msg:
+                            error_msg = self._get_no_token_error_message(generation_type)
 
-            if not supports_model_for_tier(model, token.user_paygate_tier):
-                required_tier = get_required_paygate_tier_for_model(model)
-                error_msg = "当前模型需要 " + get_paygate_tier_label(required_tier) + " 账号: " + model
-                debug_logger.log_error(f"[GENERATION] {error_msg}")
-                if stream:
-                    yield self._create_stream_chunk(f"❌ {error_msg}\n")
-                yield self._create_error_response(error_msg, status_code=403)
-                return
+                    debug_logger.log_error(f"[GENERATION] {error_msg}")
+                    await self._log_request(
+                        token_id=None,
+                        operation=request_operation,
+                        request_data=request_payload,
+                        response_data={"error": error_msg, "performance": perf_trace},
+                        status_code=503,
+                        duration=time.time() - start_time,
+                        log_id=request_log_state.get("id"),
+                        status_text="failed",
+                        progress=request_log_state.get("progress", 0),
+                    )
+                    if stream:
+                        yield self._create_stream_chunk(f"❌ {error_msg}\n")
+                    yield self._create_error_response(error_msg, status_code=503)
+                    return
 
-            ensure_project_started_at = time.time()
-            project_id = await self.token_manager.ensure_project_exists(token.id)
-            perf_trace["ensure_project_ms"] = int((time.time() - ensure_project_started_at) * 1000)
-            debug_logger.log_info(f"[GENERATION] Project ID: {project_id}")
-            await self._update_request_log_progress(
-                request_log_state,
-                token_id=token.id,
-                status_text="project_ready",
-                progress=22,
-                response_extra={"project_id": project_id},
-            )
-            prefill_action = "IMAGE_GENERATION" if generation_type == "image" else "VIDEO_GENERATION"
-            await self.flow_client.prefill_remote_browser_pool(
-                project_id=project_id,
-                action=prefill_action,
-                token_id=token.id,
-            )
+                debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
+                pending_token_state["active"] = True
+                await self._update_request_log_progress(
+                    request_log_state,
+                    token_id=token.id,
+                    status_text="token_selected",
+                    progress=8,
+                    response_extra={"token_email": token.email},
+                )
 
-            # 5. 根据类型处理
-            generation_pipeline_started_at = time.time()
-            if generation_type == "image":
-                debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
-                async for chunk in self._handle_image_generation(
-                    token, project_id, model_config, prompt, images, stream,
-                    perf_trace=perf_trace,
-                    generation_result=generation_result,
-                    response_state=response_state,
-                    request_log_state=request_log_state,
-                    pending_token_state=pending_token_state
-                ):
-                    yield chunk
-            else:  # video
-                debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
-                async for chunk in self._handle_video_generation(
-                    token, project_id, model_config, prompt, images, stream,
-                    perf_trace=perf_trace,
-                    generation_result=generation_result,
-                    response_state=response_state,
-                    request_log_state=request_log_state,
-                    pending_token_state=pending_token_state
-                ):
-                    yield chunk
-            perf_trace["generation_pipeline_ms"] = int((time.time() - generation_pipeline_started_at) * 1000)
+                try:
+                    debug_logger.log_info(f"[GENERATION] 检查Token AT有效性...")
+                    if stream:
+                        yield self._create_stream_chunk("初始化生成环境...\n")
 
-            # 6. 记录使用
+                    await self._update_request_log_progress(
+                        request_log_state,
+                        token_id=token.id,
+                        status_text="token_ready",
+                        progress=15,
+                    )
+                    ensure_at_started_at = time.time()
+                    selected_token = token
+                    refreshed_token = await self.token_manager.ensure_valid_token(selected_token)
+                    perf_trace["ensure_at_ms"] = int((time.time() - ensure_at_started_at) * 1000)
+                    if not refreshed_token:
+                        error_msg = "Token AT无效或刷新失败"
+                        debug_logger.log_error(f"[GENERATION] {error_msg}")
+                        await self._release_generation_pending_token(
+                            selected_token,
+                            generation_type,
+                            pending_token_state,
+                        )
+                        token = None
+                        if stream:
+                            yield self._create_stream_chunk("当前账号 AT 无效，尝试切换其他账号...\n")
+                        continue
+                    token = refreshed_token
+
+                    debug_logger.log_info(f"[GENERATION] 检查/创建Project...")
+
+                    if not supports_model_for_tier(model, token.user_paygate_tier):
+                        required_tier = get_required_paygate_tier_for_model(model)
+                        error_msg = "当前模型需要 " + get_paygate_tier_label(required_tier) + " 账号: " + model
+                        debug_logger.log_error(f"[GENERATION] {error_msg}")
+                        self._mark_generation_failed(
+                            generation_result,
+                            error_msg,
+                            status_code=403,
+                            error_emitted=False,
+                            count_as_token_error=False,
+                        )
+                        break
+
+                    ensure_project_started_at = time.time()
+                    project_id = await self.token_manager.ensure_project_exists(token.id)
+                    perf_trace["ensure_project_ms"] = int((time.time() - ensure_project_started_at) * 1000)
+                    debug_logger.log_info(f"[GENERATION] Project ID: {project_id}")
+                    await self._update_request_log_progress(
+                        request_log_state,
+                        token_id=token.id,
+                        status_text="project_ready",
+                        progress=22,
+                        response_extra={"project_id": project_id},
+                    )
+                    prefill_action = "IMAGE_GENERATION" if generation_type == "image" else "VIDEO_GENERATION"
+                    self._schedule_remote_browser_generation_prefill(
+                        token_id=token.id,
+                        project_id=project_id,
+                        action=prefill_action,
+                    )
+
+                    generation_pipeline_started_at = time.time()
+                    if generation_type == "image":
+                        debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
+                        async for chunk in self._handle_image_generation(
+                            token, project_id, model_config, prompt, images, stream,
+                            perf_trace=perf_trace,
+                            generation_result=generation_result,
+                            response_state=response_state,
+                            request_log_state=request_log_state,
+                            pending_token_state=pending_token_state
+                        ):
+                            yield chunk
+                    else:
+                        debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
+                        async for chunk in self._handle_video_generation(
+                            token, project_id, model_config, prompt, images, stream,
+                            perf_trace=perf_trace,
+                            generation_result=generation_result,
+                            response_state=response_state,
+                            request_log_state=request_log_state,
+                            pending_token_state=pending_token_state
+                        ):
+                            yield chunk
+                    perf_trace["generation_pipeline_ms"] = int((time.time() - generation_pipeline_started_at) * 1000)
+                    break
+                except RemoteBrowserCapacityError as capacity_error:
+                    capacity_last_error = capacity_error
+                    tried_capacity_token_ids.add(token.id)
+                    perf_trace["remote_browser_capacity_token_switches"] = max(
+                        0,
+                        len(tried_capacity_token_ids) - 1,
+                    )
+                    await self._release_generation_pending_token(
+                        token,
+                        generation_type,
+                        pending_token_state,
+                    )
+                    if stream:
+                        yield self._create_stream_chunk(
+                            f"当前账号远程打码容量不足，尝试切换其他账号... ({token.email})\n"
+                        )
+                    debug_logger.log_warning(
+                        f"[GENERATION] token={token.id} 远程打码容量不足: {capacity_error}"
+                    )
+                    continue
+
             if not generation_result.get("success"):
                 error_msg = generation_result.get("error_message") or "生成未成功完成"
+                error_status_code = max(100, int(generation_result.get("error_status_code") or 500))
+                count_as_token_error = bool(generation_result.get("count_as_token_error", True))
                 debug_logger.log_warning(f"[GENERATION] 生成未成功，不扣次数: {error_msg}")
-                if token:
+                if token and count_as_token_error:
                     await self.token_manager.record_error(token.id)
                 duration = time.time() - start_time
                 perf_trace["status"] = "failed"
                 perf_trace["total_ms"] = int(duration * 1000)
                 perf_trace["error"] = error_msg
-                prompt_for_log = prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
                 await self._log_request(
                     token.id if token else None,
                     request_operation,
                     request_payload,
                     {"error": error_msg, "performance": perf_trace},
-                    500,
+                    error_status_code,
                     duration,
                     log_id=request_log_state.get("id"),
                     status_text="failed",
@@ -985,7 +1146,7 @@ class GenerationHandler:
                 if not generation_result.get("error_emitted"):
                     if stream:
                         yield self._create_stream_chunk(f"❌ {error_msg}\n")
-                    yield self._create_error_response(error_msg, status_code=500)
+                    yield self._create_error_response(error_msg, status_code=error_status_code)
                 return
 
             is_video = (generation_type == "video")
@@ -1062,6 +1223,30 @@ class GenerationHandler:
                 progress=request_log_state.get("progress", 0),
             )
             raise
+        except RemoteBrowserCapacityError as e:
+            error_msg = self._normalize_error_message(
+                str(e) or self._build_capacity_timeout_message(),
+                max_length=240,
+            )
+            duration = time.time() - start_time
+            perf_trace["status"] = "failed"
+            perf_trace["total_ms"] = int(duration * 1000)
+            perf_trace["error"] = error_msg
+            debug_logger.log_warning(f"[GENERATION] 远程打码容量不足: {error_msg}")
+            await self._log_request(
+                token.id if token else None,
+                request_operation if generation_type else "generate_unknown",
+                request_payload if 'request_payload' in locals() else {"model": model},
+                {"error": error_msg, "performance": perf_trace},
+                503,
+                duration,
+                log_id=request_log_state.get("id"),
+                status_text="failed",
+                progress=request_log_state.get("progress", 0),
+            )
+            if stream:
+                yield self._create_stream_chunk(f"❌ {error_msg}\n")
+            yield self._create_error_response(error_msg, status_code=503)
         except Exception as e:
             error_msg = f"生成失败: {str(e)}"
             debug_logger.log_error(f"[GENERATION] ❌ {error_msg}")
@@ -1211,7 +1396,7 @@ class GenerationHandler:
             # 提取URL和mediaId
             media = result.get("media", [])
             if not media:
-                self._mark_generation_failed(generation_result, "\u751f\u6210\u7ed3\u679c\u4e3a\u7a7a")
+                self._mark_generation_failed(generation_result, "\u751f\u6210\u7ed3\u679c\u4e3a\u7a7a", status_code=502)
                 yield self._create_error_response("生成结果为空", status_code=502)
                 return
 
@@ -1318,6 +1503,26 @@ class GenerationHandler:
                             if stream:
                                 yield self._create_stream_chunk(f"⚠️ 放大失败，返回原图...\n")
                             break  # 空结果不重试
+
+                    except RemoteBrowserCapacityError as capacity_error:
+                        wait_seconds = self._resolve_capacity_wait_seconds(capacity_error)
+                        error_str = self._normalize_error_message(capacity_error, max_length=160)
+                        if retry_attempt < max_retries - 1:
+                            debug_logger.log_warning(
+                                f"[UPSAMPLE] 远程打码容量不足，等待 {wait_seconds:.1f}s 后重试当前账号放大: {error_str}"
+                            )
+                            if stream:
+                                yield self._create_stream_chunk(
+                                    f"⚠️ 放大遇到远程打码容量不足，等待 {wait_seconds:.1f}s 后重试 ({retry_attempt + 2}/{max_retries})...\n"
+                                )
+                            await asyncio.sleep(wait_seconds)
+                            continue
+                        debug_logger.log_warning(
+                            f"[UPSAMPLE] 远程打码容量不足且达到最大重试次数，返回原图: {error_str}"
+                        )
+                        if stream:
+                            yield self._create_stream_chunk("⚠️ 放大阶段远程打码容量不足，返回原图...\n")
+                        break
 
                     except Exception as e:
                         error_str = str(e)
@@ -1488,7 +1693,12 @@ class GenerationHandler:
                     error_msg = f"❌ 首尾帧模型需要 {min_images}-{max_images} 张图片,当前提供了 {image_count} 张"
                     if stream:
                         yield self._create_stream_chunk(f"{error_msg}\n")
-                    self._mark_generation_failed(generation_result, error_msg)
+                    self._mark_generation_failed(
+                        generation_result,
+                        error_msg,
+                        status_code=400,
+                        count_as_token_error=False,
+                    )
                     yield self._create_error_response(error_msg, status_code=400)
                     return
 
@@ -1498,7 +1708,12 @@ class GenerationHandler:
                     error_msg = f"❌ 多图视频模型最多支持 {max_images} 张参考图,当前提供了 {image_count} 张"
                     if stream:
                         yield self._create_stream_chunk(f"{error_msg}\n")
-                    self._mark_generation_failed(generation_result, error_msg)
+                    self._mark_generation_failed(
+                        generation_result,
+                        error_msg,
+                        status_code=400,
+                        count_as_token_error=False,
+                    )
                     yield self._create_error_response(error_msg, status_code=400)
                     return
 
@@ -1618,7 +1833,7 @@ class GenerationHandler:
             # 获取task_id和operations
             operations = result.get("operations", [])
             if not operations:
-                self._mark_generation_failed(generation_result, "\u751f\u6210\u4efb\u52a1\u521b\u5efa\u5931\u8d25")
+                self._mark_generation_failed(generation_result, "\u751f\u6210\u4efb\u52a1\u521b\u5efa\u5931\u8d25", status_code=502)
                 yield self._create_error_response("生成任务创建失败", status_code=502)
                 return
 
@@ -1731,47 +1946,68 @@ class GenerationHandler:
                     if not video_url:
                         error_msg = "视频生成失败: 视频URL为空"
                         await self._fail_video_task(checked_operations, error_msg)
-                        self._mark_generation_failed(generation_result, error_msg)
+                        self._mark_generation_failed(generation_result, error_msg, status_code=502)
                         yield self._create_error_response(error_msg, status_code=502)
                         return
 
                     # ========== 视频放大处理 ==========
                     if upsample_config and video_media_id:
+                        resolution_name = "4K" if "4K" in upsample_config["resolution"] else "1080P"
                         if stream:
-                            resolution_name = "4K" if "4K" in upsample_config["resolution"] else "1080P"
                             yield self._create_stream_chunk(f"\n视频生成完成，开始 {resolution_name} 放大处理...（可能需要 30 分钟）\n")
-                        
-                        try:
-                            # 提交放大任务
-                            upsample_result = await self.flow_client.upsample_video(
-                                at=token.at,
-                                project_id=project_id,
-                                video_media_id=video_media_id,
-                                aspect_ratio=aspect_ratio,
-                                resolution=upsample_config["resolution"],
-                                model_key=upsample_config["model_key"],
-                                token_id=token.id,
-                                token_video_concurrency=token.video_concurrency,
-                            )
-                            
-                            upsample_operations = upsample_result.get("operations", [])
-                            if upsample_operations:
-                                if stream:
-                                    yield self._create_stream_chunk("放大任务已提交，继续轮询...\n")
-                                
-                                # 递归轮询放大结果（不再放大）
-                                async for chunk in self._poll_video_result(
-                                    token, project_id, upsample_operations, stream, None, generation_result, response_state, request_log_state
-                                ):
-                                    yield chunk
-                                return
-                            else:
+
+                        max_upsample_retries = 3
+                        for retry_attempt in range(max_upsample_retries):
+                            try:
+                                upsample_result = await self.flow_client.upsample_video(
+                                    at=token.at,
+                                    project_id=project_id,
+                                    video_media_id=video_media_id,
+                                    aspect_ratio=aspect_ratio,
+                                    resolution=upsample_config["resolution"],
+                                    model_key=upsample_config["model_key"],
+                                    token_id=token.id,
+                                    token_video_concurrency=token.video_concurrency,
+                                )
+
+                                upsample_operations = upsample_result.get("operations", [])
+                                if upsample_operations:
+                                    if stream:
+                                        yield self._create_stream_chunk("放大任务已提交，继续轮询...\n")
+
+                                    async for chunk in self._poll_video_result(
+                                        token, project_id, upsample_operations, stream, None, generation_result, response_state, request_log_state
+                                    ):
+                                        yield chunk
+                                    return
+
                                 if stream:
                                     yield self._create_stream_chunk("⚠️ 放大任务创建失败，返回原始视频\n")
-                        except Exception as e:
-                            debug_logger.log_error(f"Video upsample failed: {str(e)}")
-                            if stream:
-                                yield self._create_stream_chunk(f"⚠️ 放大失败: {str(e)}，返回原始视频\n")
+                                break
+                            except RemoteBrowserCapacityError as capacity_error:
+                                wait_seconds = self._resolve_capacity_wait_seconds(capacity_error)
+                                error_str = self._normalize_error_message(capacity_error, max_length=160)
+                                if retry_attempt < max_upsample_retries - 1:
+                                    debug_logger.log_warning(
+                                        f"[VIDEO UPSAMPLE] 远程打码容量不足，等待 {wait_seconds:.1f}s 后重试当前账号放大: {error_str}"
+                                    )
+                                    if stream:
+                                        yield self._create_stream_chunk(
+                                            f"⚠️ 视频放大遇到远程打码容量不足，等待 {wait_seconds:.1f}s 后重试 ({retry_attempt + 2}/{max_upsample_retries})...\n"
+                                        )
+                                    await asyncio.sleep(wait_seconds)
+                                    continue
+                                debug_logger.log_warning(
+                                    f"[VIDEO UPSAMPLE] 远程打码容量不足且达到最大重试次数，返回原始视频: {error_str}"
+                                )
+                                if stream:
+                                    yield self._create_stream_chunk("⚠️ 视频放大阶段远程打码容量不足，返回原始视频\n")
+                                break
+                            except Exception as e:
+                                debug_logger.log_error(f"Video upsample failed: {str(e)}")
+                                if stream:
+                                    yield self._create_stream_chunk(f"⚠️ 放大失败: {str(e)}，返回原始视频\n")
+                                break
 
                     # 缓存视频 (如果启用)
                     local_url = video_url
@@ -1841,7 +2077,7 @@ class GenerationHandler:
                     
                     # 返回友好的错误消息，提示用户重试
                     friendly_error = f"视频生成失败: {error_message}，请重试"
-                    self._mark_generation_failed(generation_result, friendly_error)
+                    self._mark_generation_failed(generation_result, friendly_error, status_code=502)
                     if stream:
                         yield self._create_stream_chunk(f"❌ {friendly_error}\n")
                     yield self._create_error_response(friendly_error, status_code=502)
@@ -1851,7 +2087,7 @@ class GenerationHandler:
                     # ??????
                     error_msg = f"视频生成失败: {status}"
                     await self._fail_video_task(checked_operations, error_msg)
-                    self._mark_generation_failed(generation_result, error_msg)
+                    self._mark_generation_failed(generation_result, error_msg, status_code=502)
                     yield self._create_error_response(error_msg, status_code=502)
                     return
 
@@ -1862,7 +2098,7 @@ class GenerationHandler:
                 if consecutive_poll_errors >= max_consecutive_poll_errors:
                     error_msg = f"视频状态查询失败: {self._normalize_error_message(e)}"
                     await self._fail_video_task(operations, error_msg)
-                    self._mark_generation_failed(generation_result, error_msg)
+                    self._mark_generation_failed(generation_result, error_msg, status_code=502)
                     if stream:
                         yield self._create_stream_chunk(f"❌ {error_msg}\n")
                     yield self._create_error_response(error_msg, status_code=502)
@@ -1875,7 +2111,7 @@ class GenerationHandler:
         else:
             error_msg = f"视频生成超时 (已轮询 {max_attempts} 次)"
         await self._fail_video_task(operations, error_msg)
-        self._mark_generation_failed(generation_result, error_msg)
+        self._mark_generation_failed(generation_result, error_msg, status_code=504)
         yield self._create_error_response(error_msg, status_code=504)
 
     # ========== 响应格式化 ==========
